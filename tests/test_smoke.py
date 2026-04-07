@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -17,8 +18,10 @@ from car_driver.environment import (
     track_self_intersects,
 )
 from car_driver.training import (
+    TorchDeviceInfo,
     TrainerSession,
     load_brain_checkpoint,
+    resolve_torch_device,
     save_brain_checkpoint,
 )
 from car_driver.ui_app import MainApplication, describe_evaluation_outcome
@@ -43,6 +46,31 @@ def fast_test_config() -> AppConfig:
 
 
 class CarDriverSmokeTests(unittest.TestCase):
+    def test_resolve_torch_device_falls_back_to_cpu_after_probe_error(self) -> None:
+        def fake_probe(device_type: str, device_index: int | None = None):
+            if device_type == "cuda":
+                raise RuntimeError("driver init failed")
+            return None
+
+        with mock.patch("car_driver.training._probe_gpu_backend", side_effect=fake_probe):
+            device_info = resolve_torch_device()
+
+        self.assertEqual(device_info.backend, "cpu")
+        self.assertEqual(device_info.device.type, "cpu")
+        self.assertTrue(any("CUDA probe failed" in warning for warning in device_info.warnings))
+
+    def test_resolve_torch_device_returns_requested_gpu_when_probe_succeeds(self) -> None:
+        expected = TorchDeviceInfo(
+            device=torch.device("cuda"),
+            backend="cuda",
+            description="CUDA GPU (Mock)",
+        )
+        with mock.patch("car_driver.training._probe_gpu_backend", return_value=expected):
+            device_info = resolve_torch_device("cuda")
+
+        self.assertEqual(device_info.backend, "cuda")
+        self.assertEqual(str(device_info.device), "cuda")
+
     def test_parallel_env_setting_is_configurable_and_capped_by_generation_size(self) -> None:
         config = fast_test_config()
         config.ppo.parallel_envs = 2

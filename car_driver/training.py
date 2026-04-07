@@ -144,6 +144,18 @@ class ActiveEpisode:
     trajectory: EpisodeTrajectory = field(default_factory=EpisodeTrajectory)
 
 
+@dataclass
+class TorchDeviceInfo:
+    device: torch.device
+    backend: str
+    description: str
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def is_gpu(self) -> bool:
+        return self.backend != "cpu"
+
+
 class ObservationNormalizer:
     def __init__(
         self,
@@ -204,6 +216,130 @@ class ObservationNormalizer:
             "count": float(self.count),
             "clip_value": float(self.clip_value),
         }
+
+
+def _cpu_device_info(warnings: list[str] | None = None) -> TorchDeviceInfo:
+    return TorchDeviceInfo(
+        device=torch.device("cpu"),
+        backend="cpu",
+        description="CPU",
+        warnings=list(warnings or []),
+    )
+
+
+def _probe_gpu_backend(
+    device_type: str,
+    device_index: int | None = None,
+) -> TorchDeviceInfo | None:
+    backend_module = getattr(torch, device_type, None)
+    if backend_module is None:
+        return None
+
+    is_available = getattr(backend_module, "is_available", None)
+    if not callable(is_available):
+        return None
+
+    available = bool(is_available())
+    if not available:
+        return None
+
+    device_name = device_type if device_index is None else f"{device_type}:{device_index}"
+    device = torch.device(device_name)
+    probe = torch.zeros(4, device=device, dtype=torch.float32)
+    probe = probe + 1.0
+    _ = float(probe.sum().item())
+
+    synchronize = getattr(backend_module, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+
+    backend_label = "rocm" if device_type == "cuda" and getattr(torch.version, "hip", None) else device_type
+    readable_backend = {
+        "cuda": "CUDA GPU",
+        "rocm": "ROCm GPU",
+        "xpu": "XPU GPU",
+    }.get(backend_label, f"{backend_label.upper()} device")
+
+    accelerator_name = None
+    get_device_name = getattr(backend_module, "get_device_name", None)
+    if callable(get_device_name):
+        try:
+            accelerator_name = str(get_device_name(device_index or 0))
+        except Exception:
+            accelerator_name = None
+
+    description = readable_backend
+    if accelerator_name:
+        description = f"{description} ({accelerator_name})"
+
+    return TorchDeviceInfo(
+        device=device,
+        backend=backend_label,
+        description=description,
+    )
+
+
+def resolve_torch_device(
+    requested_device: str | torch.device | None = None,
+) -> TorchDeviceInfo:
+    warnings: list[str] = []
+
+    if requested_device is not None:
+        try:
+            requested = torch.device(requested_device)
+        except Exception as exc:
+            return _cpu_device_info(
+                [f"Requested compute device {requested_device!r} was invalid: {exc}"]
+            )
+        if requested.type == "cpu":
+            return _cpu_device_info()
+        if requested.type not in {"cuda", "xpu"}:
+            return TorchDeviceInfo(
+                device=requested,
+                backend=requested.type,
+                description=f"{requested.type.upper()} device ({requested})",
+            )
+        try:
+            device_info = _probe_gpu_backend(requested.type, requested.index)
+            if device_info is not None:
+                return device_info
+            return _cpu_device_info(
+                [f"Requested {requested.type.upper()} device is not available. Falling back to CPU."]
+            )
+        except Exception as exc:
+            return _cpu_device_info(
+                [f"{requested.type.upper()} probe failed: {exc}. Falling back to CPU."]
+            )
+
+    for candidate in ("cuda", "xpu"):
+        try:
+            device_info = _probe_gpu_backend(candidate)
+            if device_info is not None:
+                return device_info
+        except Exception as exc:
+            warnings.append(
+                f"{candidate.upper()} probe failed: {exc}. Falling back to the next device."
+            )
+
+    return _cpu_device_info(warnings)
+
+
+def seed_torch_backends(seed: int) -> None:
+    torch.manual_seed(seed)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+    xpu_backend = getattr(torch, "xpu", None)
+    xpu_manual_seed_all = getattr(xpu_backend, "manual_seed_all", None)
+    xpu_is_available = getattr(xpu_backend, "is_available", None)
+    if callable(xpu_manual_seed_all) and callable(xpu_is_available):
+        try:
+            if xpu_is_available():
+                xpu_manual_seed_all(seed)
+        except Exception:
+            pass
 
 
 class RolloutBuffer:
@@ -562,21 +698,33 @@ class TrainerSession:
         initial_best_observation_normalizer_state: dict[str, Any] | None = None,
     ) -> None:
         self.config = copy.deepcopy(config)
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device_info = resolve_torch_device(device)
+        self.device = self.device_info.device
         self.observation_names = build_observation_names(self.config.sensors)
-        torch.manual_seed(self.config.ppo.seed)
         np.random.seed(self.config.ppo.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.config.ppo.seed)
+        seed_torch_backends(self.config.ppo.seed)
 
-        self.model = ActorCritic(
-            observation_dim=len(self.observation_names),
-            action_dim=len(ACTION_NAMES),
-            network_config=self.config.network,
-            init_std=self.config.ppo.init_std,
-        ).to(self.device)
+        try:
+            self.model = ActorCritic(
+                observation_dim=len(self.observation_names),
+                action_dim=len(ACTION_NAMES),
+                network_config=self.config.network,
+                init_std=self.config.ppo.init_std,
+            ).to(self.device)
+        except Exception as exc:
+            if self.device.type == "cpu":
+                raise
+            self.device_info = _cpu_device_info(
+                self.device_info.warnings
+                + [f"{self.device_info.description} initialization failed: {exc}. Falling back to CPU."]
+            )
+            self.device = self.device_info.device
+            self.model = ActorCritic(
+                observation_dim=len(self.observation_names),
+                action_dim=len(ACTION_NAMES),
+                network_config=self.config.network,
+                init_std=self.config.ppo.init_std,
+            ).to(self.device)
         if initial_state_dict is not None:
             self.model.load_state_dict(initial_state_dict)
 
@@ -907,14 +1055,25 @@ class TrainerSession:
 def build_policy_from_state(
     config: AppConfig,
     state_dict: dict[str, torch.Tensor] | None = None,
-    device: str | torch.device = "cpu",
+    device: str | torch.device | None = None,
 ) -> ActorCritic:
-    policy = ActorCritic(
-        observation_dim=len(build_observation_names(config.sensors)),
-        action_dim=len(ACTION_NAMES),
-        network_config=config.network,
-        init_std=config.ppo.init_std,
-    ).to(device)
+    device_info = resolve_torch_device(device)
+    try:
+        policy = ActorCritic(
+            observation_dim=len(build_observation_names(config.sensors)),
+            action_dim=len(ACTION_NAMES),
+            network_config=config.network,
+            init_std=config.ppo.init_std,
+        ).to(device_info.device)
+    except Exception as exc:
+        if device_info.device.type == "cpu":
+            raise
+        policy = ActorCritic(
+            observation_dim=len(build_observation_names(config.sensors)),
+            action_dim=len(ACTION_NAMES),
+            network_config=config.network,
+            init_std=config.ppo.init_std,
+        ).to("cpu")
     if state_dict is not None:
         try:
             policy.load_state_dict(state_dict)

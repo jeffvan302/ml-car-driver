@@ -97,6 +97,9 @@ def run_headless_training(args: argparse.Namespace) -> int:
             else None
         ),
     )
+    print(f"Using compute device: {session.device_info.description}")
+    for warning in session.device_info.warnings:
+        print(f"- {warning}")
     summary = session.train()
 
     print(

@@ -13,11 +13,13 @@ from car_driver.ppo import ACTION_NAMES
 from car_driver.training import (
     GenerationReport,
     ObservationNormalizer,
+    TorchDeviceInfo,
     TrainerSession,
     TrainingSummary,
     build_policy_from_state,
     clone_normalizer_state,
     clone_state_dict,
+    resolve_torch_device,
     is_better_candidate,
     load_brain_checkpoint,
     normalize_observation_array,
@@ -32,6 +34,7 @@ class TrainingBridge:
     def __init__(
         self,
         config: AppConfig,
+        device: str | None,
         history: list[GenerationReport],
         current_state_dict: dict | None,
         best_state_dict: dict | None,
@@ -48,6 +51,7 @@ class TrainingBridge:
             target=self._run,
             args=(
                 config,
+                device,
                 history,
                 current_state_dict,
                 best_state_dict,
@@ -65,6 +69,7 @@ class TrainingBridge:
     def _run(
         self,
         config: AppConfig,
+        device: str | None,
         history: list[GenerationReport],
         current_state_dict: dict | None,
         best_state_dict: dict | None,
@@ -76,6 +81,7 @@ class TrainingBridge:
         try:
             self.session = TrainerSession(
                 config=config,
+                device=device,
                 initial_history=history,
                 initial_state_dict=current_state_dict,
                 initial_best_state_dict=best_state_dict,
@@ -158,6 +164,7 @@ class MainApplication:
         self._configure_style()
 
         self.config = AppConfig()
+        self.compute_device_info: TorchDeviceInfo = resolve_torch_device()
         self.history: list[GenerationReport] = []
         self.best_metrics = {"finish_rate": -1.0, "mean_score": float("-inf")}
         self.current_state_dict: dict | None = None
@@ -183,7 +190,10 @@ class MainApplication:
         }
         self.training_bridge: TrainingBridge | None = None
         self.pause_pending = False
-        self.status_var = tk.StringVar(value="Ready.")
+        initial_status = f"Ready. Compute device: {self.compute_device_info.description}."
+        if self.compute_device_info.warnings:
+            initial_status += f" {self.compute_device_info.warnings[0]}"
+        self.status_var = tk.StringVar(value=initial_status)
         self.closed = False
 
         self._build_layout()
@@ -431,7 +441,10 @@ class MainApplication:
 
     def _reset_brains(self, config: AppConfig) -> None:
         self.config = config
-        fresh = build_policy_from_state(self.config, device="cpu")
+        fresh = build_policy_from_state(
+            self.config,
+            device=self.compute_device_info.device,
+        )
         self.current_state_dict = clone_state_dict(fresh.state_dict())
         self.best_state_dict = clone_state_dict(fresh.state_dict())
         self.current_optimizer_state_dict = {}
@@ -445,13 +458,13 @@ class MainApplication:
         self.current_policy = build_policy_from_state(
             self.config,
             state_dict=self.current_state_dict,
-            device="cpu",
+            device=self.compute_device_info.device,
         )
         best_state = self.best_state_dict or self.current_state_dict
         self.best_policy = build_policy_from_state(
             self.config,
             state_dict=best_state,
-            device="cpu",
+            device=self.compute_device_info.device,
         )
         self._refresh_network_visualization()
 
@@ -554,7 +567,7 @@ class MainApplication:
             )
             action = policy.act_numpy(
                 normalized_observation,
-                device="cpu",
+                device=self.compute_device_info.device,
                 deterministic=True,
             )
             self.eval_observation, _, done, info = self.eval_env.step(action)
@@ -640,9 +653,12 @@ class MainApplication:
         self.pause_pending = False
         self.control_panel.set_training_running(True, pause_pending=False)
         status_message = (
-            "Training is running. Pause waits for the generation boundary; "
+            f"Training is running on {self.compute_device_info.description}. "
+            "Pause waits for the generation boundary; "
             "Stop finishes active episodes and then stops."
         )
+        if self.compute_device_info.warnings:
+            status_message += " " + " ".join(self.compute_device_info.warnings[:1])
         if validation.warnings:
             status_message += " Warnings: " + "; ".join(validation.warnings[:3])
         self.control_panel.set_session_status(status_message)
@@ -653,6 +669,7 @@ class MainApplication:
         )
         self.training_bridge = TrainingBridge(
             config=self.config,
+            device=str(self.compute_device_info.device),
             history=list(self.history),
             current_state_dict=clone_state_dict(self.current_state_dict) if self.current_state_dict else None,
             best_state_dict=clone_state_dict(self.best_state_dict) if self.best_state_dict else None,
