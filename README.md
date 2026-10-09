@@ -12,6 +12,21 @@ It combines:
 
 For the tracked implementation scope, see [project_requirements.md](./project_requirements.md).
 
+![Car Driver Lab: the trained PPO policy driving a procedurally generated road, with training curves and a live view of the actor network](docs/car_demo.gif)
+
+*The bundled `car_driver_best_brain.pt` (72 generations, 83% best finish rate) driving an unseen road. Center: first-person view with a top-down debug inset and training curves. Right: the actor network's live activations.*
+
+## Quick Start
+
+**Windows, no Python needed:** run `launch.exe`. It downloads a standalone Python runtime into a local `runtime/` folder, installs the requirements there, and opens the app, so nothing touches your system Python. The first run takes a few minutes; later runs start immediately. The launcher's source is in [jeffvan302/ml-example](https://github.com/jeffvan302/ml-example/tree/main/win-launcher).
+
+**Any OS, with Python 3.12:**
+
+```bash
+pip install -r requirements.txt
+python run.py gui --load car_driver_best_brain.pt
+```
+
 ## Features
 
 - `run.py` launches the GUI or headless training
